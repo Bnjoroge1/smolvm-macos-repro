@@ -103,6 +103,42 @@ jobs:
             echo "=== $f ==="; tail -30 "$f" || true
           done
 
+  # Sample the host lottery: N independent jobs, each boots one VM. A host
+  # where hv_vm_create fails should show up as a failed job; correlate with
+  # the sysctl probe output.
+  lottery:
+    name: "lottery ${{ matrix.os }} #${{ matrix.i }}"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+        i: [1, 2, 3, 4, 5, 6]
+    env:
+      SMOLVM_VERSION: ${{ inputs.smolvm_version }}
+    steps:
+      - name: Environment probe
+        run: |
+          for k in machdep.cpu.brand_string kern.hv_support kern.hv_vm_present kern.hv_vmm_present hw.ncpu hw.memsize; do
+            echo "$k = $(sysctl -n $k 2>/dev/null || echo MISSING)"
+          done
+          sw_vers
+
+      - name: Install smolvm ${{ env.SMOLVM_VERSION }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="smolvm-${SMOLVM_VERSION}-darwin-arm64.tar.gz"
+          BASE="https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}"
+          smolvm machine create --name lot \
+            --image alpine:latest \
+            --cpus 8 --mem 4096 \
+            --storage 200 --overlay 200 \
+            --net --net-backend tsi --dns 1.1.1.1 \
+            -- /bin/sh -c "sleep infinity"
+          smolvm machine start --name lot
+          smolvm machine exec --name lot -- uname -a
+          smolvm machine delete --name lot -f
+
   # Mirror the exact shape preloop build-golden uses:
   #   smolvm machine create --name X --image <img> --cpus 8 --mem 4096
   #     --storage 200 --overlay 200 --net --net-backend tsi --dns 1.1.1.1
@@ -122,7 +158,9 @@ jobs:
         run: |
           set -x
           sw_vers
-          sysctl -n machdep.cpu.brand_string kern.hv_support kern.hv_vm_present hw.ncpu hw.memsize 2>/dev/null || true
+          for k in machdep.cpu.brand_string kern.hv_support kern.hv_vm_present kern.hv_vmm_present hw.ncpu hw.memsize; do
+            echo "$k = $(sysctl -n $k 2>/dev/null || echo MISSING)"
+          done
           df -h "$HOME" | tail -1
 
       - name: Install smolvm ${{ env.SMOLVM_VERSION }}
