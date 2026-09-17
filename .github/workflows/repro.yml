@@ -24,11 +24,9 @@ jobs:
         run: |
           set -x
           sw_vers
-          sysctl -n machdep.cpu.brand_string || true
-          sysctl -n kern.hv_support || true
-          sysctl -n kern.hv_vm_present || true
-          sysctl -n hw.ncpu hw.memsize || true
-          uname -a
+          for k in machdep.cpu.brand_string kern.hv_support kern.hv_vm_present kern.hv_vmm_present hw.ncpu hw.memsize; do
+            echo "$k = $(sysctl -n $k 2>/dev/null || echo MISSING)"
+          done
           df -h "$HOME" | tail -1
 
       - name: Install smolvm ${{ env.SMOLVM_VERSION }}
@@ -59,7 +57,6 @@ jobs:
         run: |
           codesign -d --entitlements - "$HOME/.smolvm/smolvm" 2>&1 || true
           codesign -d --entitlements - "$HOME/.smolvm/smolvm-bin" 2>&1 || true
-          codesign -dv "$HOME/.smolvm/smolvm" 2>&1 || true
           smolvm --version || true
 
       - name: smolvm machine create + start
@@ -102,42 +99,6 @@ jobs:
           for f in $(find "$HOME/Library/Caches/smolvm" -name "*.log" 2>/dev/null | head -5); do
             echo "=== $f ==="; tail -30 "$f" || true
           done
-
-  # Sample the host lottery: N independent jobs, each boots one VM. A host
-  # where hv_vm_create fails should show up as a failed job; correlate with
-  # the sysctl probe output.
-  lottery:
-    name: "lottery ${{ matrix.os }} #${{ matrix.i }}"
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-14, macos-15]
-        i: [1, 2, 3, 4, 5, 6]
-    env:
-      SMOLVM_VERSION: ${{ inputs.smolvm_version }}
-    steps:
-      - name: Environment probe
-        run: |
-          for k in machdep.cpu.brand_string kern.hv_support kern.hv_vm_present kern.hv_vmm_present hw.ncpu hw.memsize; do
-            echo "$k = $(sysctl -n $k 2>/dev/null || echo MISSING)"
-          done
-          sw_vers
-
-      - name: Install smolvm ${{ env.SMOLVM_VERSION }}
-        run: |
-          set -euo pipefail
-          ARCHIVE="smolvm-${SMOLVM_VERSION}-darwin-arm64.tar.gz"
-          BASE="https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}"
-          smolvm machine create --name lot \
-            --image alpine:latest \
-            --cpus 8 --mem 4096 \
-            --storage 200 --overlay 200 \
-            --net --net-backend tsi --dns 1.1.1.1 \
-            -- /bin/sh -c "sleep infinity"
-          smolvm machine start --name lot
-          smolvm machine exec --name lot -- uname -a
-          smolvm machine delete --name lot -f
 
   # Mirror the exact shape preloop build-golden uses:
   #   smolvm machine create --name X --image <img> --cpus 8 --mem 4096
@@ -235,3 +196,59 @@ jobs:
           for f in $(find "$HOME/Library/Caches/smolvm" -name "*.log" 2>/dev/null | head -5); do
             echo "=== $f ==="; tail -30 "$f" || true
           done
+
+  # Sample the host lottery: N independent jobs, each boots one VM with the
+  # preloop arg shape. A host where hv_vm_create fails shows up as a failed
+  # job; correlate with the sysctl probe output.
+  lottery:
+    name: "lottery ${{ matrix.os }} #${{ matrix.i }}"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+        i: [1, 2, 3, 4, 5, 6]
+    env:
+      SMOLVM_VERSION: ${{ inputs.smolvm_version }}
+    steps:
+      - name: Environment probe
+        run: |
+          for k in machdep.cpu.brand_string kern.hv_support kern.hv_vm_present kern.hv_vmm_present hw.ncpu hw.memsize; do
+            echo "$k = $(sysctl -n $k 2>/dev/null || echo MISSING)"
+          done
+          sw_vers
+
+      - name: Install smolvm ${{ env.SMOLVM_VERSION }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="smolvm-${SMOLVM_VERSION}-darwin-arm64.tar.gz"
+          BASE="https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}"
+          curl -fsSL -o "$ARCHIVE" "$BASE/$ARCHIVE"
+          tar -xzf "$ARCHIVE"
+          SRC="smolvm-${SMOLVM_VERSION}-darwin-arm64"
+          mkdir -p "$HOME/.smolvm"
+          cp -R "$SRC/lib" "$HOME/.smolvm/lib"
+          for f in smolvm smolvm-bin storage-template.ext4 overlay-template.ext4; do
+            [ -f "$SRC/$f" ] && cp "$SRC/$f" "$HOME/.smolvm/"
+          done
+          mkdir -p "$HOME/Library/Application Support/smolvm"
+          cp -R "$SRC/agent-rootfs" "$HOME/Library/Application Support/smolvm/agent-rootfs"
+          mkdir -p "$HOME/.local/bin"
+          ln -sf "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Boot one VM (preloop shape)
+        env:
+          RUST_LOG: info
+          SMOLVM_KRUN_LOG_LEVEL: "4"
+        run: |
+          set -x
+          smolvm machine create --name lot \
+            --image alpine:latest \
+            --cpus 8 --mem 4096 \
+            --storage 200 --overlay 200 \
+            --net --net-backend tsi --dns 1.1.1.1 \
+            -- /bin/sh -c "sleep infinity"
+          smolvm machine start --name lot
+          smolvm machine exec --name lot -- uname -a
+          smolvm machine delete --name lot -f
