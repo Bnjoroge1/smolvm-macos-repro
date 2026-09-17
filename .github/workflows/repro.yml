@@ -269,3 +269,59 @@ jobs:
           smolvm machine start --name lot
           smolvm machine exec --name lot -- uname -a
           smolvm machine delete --name lot -f
+
+  # Verify the hv_vm_create probe diagnostic: build the fix branch's binary,
+  # sign it with the hypervisor entitlement, swap it in as smolvm-bin over a
+  # released 1.16.1 install, and boot. On a hosted runner the boot must fail
+  # with the new "cannot run VMs on this host" message, not the generic
+  # disk/overlay hint.
+  probe-fix:
+    name: "probe-fix / ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    steps:
+      - name: Install released smolvm 1.16.1 (lib + rootfs + templates)
+        run: |
+          set -euo pipefail
+          ARCHIVE="smolvm-1.16.1-darwin-arm64.tar.gz"
+          BASE="https://github.com/smol-machines/smolvm/releases/download/v1.16.1"
+          curl -fsSL -o "$ARCHIVE" "$BASE/$ARCHIVE"
+          tar -xzf "$ARCHIVE"
+          SRC="smolvm-1.16.1-darwin-arm64"
+          mkdir -p "$HOME/.smolvm"
+          cp -R "$SRC/lib" "$HOME/.smolvm/lib"
+          for f in smolvm smolvm-bin storage-template.ext4 overlay-template.ext4 \
+              storage-template.ext4.zst overlay-template.ext4.zst; do
+            [ -f "$SRC/$f" ] && cp "$SRC/$f" "$HOME/.smolvm/"
+          done
+          mkdir -p "$HOME/Library/Application Support/smolvm"
+          cp -R "$SRC/agent-rootfs" "$HOME/Library/Application Support/smolvm/agent-rootfs"
+          mkdir -p "$HOME/.local/bin"
+          ln -sf "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build smolvm from the fix branch and swap it in
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch fix/pack-vm-storage-and-hv-probe \
+            https://github.com/preloopdev/smolvm.git smolvm-src
+          cd smolvm-src
+          cargo build --release --bin smolvm
+          codesign --force --sign - --entitlements smolvm.entitlements target/release/smolvm
+          codesign -d --entitlements - target/release/smolvm 2>&1 | grep -A1 hypervisor || true
+          cp target/release/smolvm "$HOME/.smolvm/smolvm-bin"
+
+      - name: machine create + start — expect the nested-virt diagnostic
+        id: create
+        continue-on-error: true
+        env:
+          RUST_LOG: info
+          SMOLVM_KRUN_LOG_LEVEL: "4"
+        run: |
+          set -x
+          smolvm machine create --name probe
+          smolvm machine start --name probe
+          smolvm machine exec --name probe -- uname -a
