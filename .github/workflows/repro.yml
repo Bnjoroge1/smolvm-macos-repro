@@ -201,12 +201,13 @@ jobs:
   # preloop arg shape. A host where hv_vm_create fails shows up as a failed
   # job; correlate with the sysctl probe output.
   lottery:
-    name: "lottery ${{ matrix.os }} #${{ matrix.i }}"
+    name: "lottery ${{ matrix.os }} ${{ matrix.disks }} #${{ matrix.i }}"
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [macos-14, macos-15]
+        disks: [default, raw200, ext4-200]
         i: [1, 2, 3, 4, 5, 6]
     env:
       SMOLVM_VERSION: ${{ inputs.smolvm_version }}
@@ -228,7 +229,8 @@ jobs:
           SRC="smolvm-${SMOLVM_VERSION}-darwin-arm64"
           mkdir -p "$HOME/.smolvm"
           cp -R "$SRC/lib" "$HOME/.smolvm/lib"
-          for f in smolvm smolvm-bin storage-template.ext4 overlay-template.ext4; do
+          for f in smolvm smolvm-bin storage-template.ext4 overlay-template.ext4 \
+              storage-template.ext4.zst overlay-template.ext4.zst; do
             [ -f "$SRC/$f" ] && cp "$SRC/$f" "$HOME/.smolvm/"
           done
           mkdir -p "$HOME/Library/Application Support/smolvm"
@@ -237,16 +239,31 @@ jobs:
           ln -sf "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      - name: Prepare 200G ext4 templates (ext4-200 only)
+        if: matrix.disks == 'ext4-200'
+        run: |
+          set -euo pipefail
+          brew install e2fsprogs 2>/dev/null || true
+          export PATH="$(brew --prefix e2fsprogs)/sbin:$PATH"
+          rm -f "$HOME/.smolvm/storage-template.ext4" "$HOME/.smolvm/overlay-template.ext4" \
+                "$HOME/.smolvm/storage-template.ext4.zst" "$HOME/.smolvm/overlay-template.ext4.zst"
+          truncate -s 200G "$HOME/.smolvm/storage-template.ext4"
+          mkfs.ext4 -F -q -O ^has_journal -b 4096 "$HOME/.smolvm/storage-template.ext4"
+          truncate -s 200G "$HOME/.smolvm/overlay-template.ext4"
+          mkfs.ext4 -F -q -O ^has_journal -b 4096 -L smolvm-overlay "$HOME/.smolvm/overlay-template.ext4"
+
       - name: Boot one VM (preloop shape)
         env:
           RUST_LOG: info
           SMOLVM_KRUN_LOG_LEVEL: "4"
         run: |
           set -x
+          STORAGE=20; OVERLAY=10
+          if [ "${{ matrix.disks }}" != "default" ]; then STORAGE=200; OVERLAY=200; fi
           smolvm machine create --name lot \
             --image alpine:latest \
             --cpus 8 --mem 4096 \
-            --storage 200 --overlay 200 \
+            --storage $STORAGE --overlay $OVERLAY \
             --net --net-backend tsi --dns 1.1.1.1 \
             -- /bin/sh -c "sleep infinity"
           smolvm machine start --name lot
