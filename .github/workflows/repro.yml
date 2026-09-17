@@ -1,0 +1,105 @@
+name: smolvm-macos-einval-repro
+
+on:
+  workflow_dispatch:
+    inputs:
+      smolvm_version:
+        description: "smolvm release version"
+        required: true
+        default: "1.16.1"
+
+jobs:
+  repro:
+    name: "${{ matrix.os }} / ${{ matrix.backend }}"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-latest]
+        backend: [none, tsi, virtio-net]
+    env:
+      SMOLVM_VERSION: ${{ inputs.smolvm_version }}
+    steps:
+      - name: Environment probe
+        run: |
+          set -x
+          sw_vers
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n kern.hv_support || true
+          sysctl -n kern.hv_vm_present || true
+          uname -a
+          df -h "$HOME" | tail -1
+
+      - name: Install smolvm ${{ env.SMOLVM_VERSION }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="smolvm-${SMOLVM_VERSION}-darwin-arm64.tar.gz"
+          BASE="https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}"
+          curl -fsSL -o "$ARCHIVE" "$BASE/$ARCHIVE"
+          curl -fsSL -o checksums.sha256 "$BASE/checksums.sha256"
+          grep -F "$ARCHIVE" checksums.sha256 | shasum -a 256 -c -
+          tar -xzf "$ARCHIVE"
+          SRC="smolvm-${SMOLVM_VERSION}-darwin-arm64"
+          mkdir -p "$HOME/.smolvm"
+          rm -rf "$HOME/.smolvm/lib"
+          cp -R "$SRC/lib" "$HOME/.smolvm/lib"
+          for f in smolvm smolvm-bin storage-template.ext4 overlay-template.ext4 \
+              storage-template.ext4.zst overlay-template.ext4.zst; do
+            [ -f "$SRC/$f" ] && cp "$SRC/$f" "$HOME/.smolvm/"
+          done
+          mkdir -p "$HOME/Library/Application Support/smolvm"
+          rm -rf "$HOME/Library/Application Support/smolvm/agent-rootfs"
+          cp -R "$SRC/agent-rootfs" "$HOME/Library/Application Support/smolvm/agent-rootfs"
+          mkdir -p "$HOME/.local/bin"
+          ln -sf "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Entitlement check
+        run: |
+          codesign -d --entitlements - "$HOME/.smolvm/smolvm" 2>&1 || true
+          codesign -d --entitlements - "$HOME/.smolvm/smolvm-bin" 2>&1 || true
+          codesign -dv "$HOME/.smolvm/smolvm" 2>&1 || true
+          smolvm --version || true
+
+      - name: smolvm machine create + start
+        id: create
+        continue-on-error: true
+        env:
+          RUST_LOG: info
+          SMOLVM_KRUN_LOG_LEVEL: "4"
+        run: |
+          set -x
+          case "${{ matrix.backend }}" in
+            none)       NETARGS="" ;;
+            tsi)        NETARGS="--net --net-backend tsi" ;;
+            virtio-net) NETARGS="--net --net-backend virtio-net" ;;
+          esac
+          smolvm machine create --name repro $NETARGS
+          smolvm machine start --name repro
+          smolvm machine exec --name repro -- uname -a
+          smolvm machine stop --name repro
+          smolvm machine delete --name repro -f
+
+      - name: smolvm machine run (ephemeral)
+        if: always()
+        continue-on-error: true
+        env:
+          RUST_LOG: info
+          SMOLVM_KRUN_LOG_LEVEL: "4"
+        run: |
+          set -x
+          case "${{ matrix.backend }}" in
+            none)       NETARGS="" ;;
+            tsi)        NETARGS="--net --net-backend tsi" ;;
+            virtio-net) NETARGS="--net --net-backend virtio-net" ;;
+          esac
+          smolvm machine run $NETARGS -- echo hello-from-guest
+
+      - name: Collect agent console logs
+        if: always()
+        run: |
+          find "$HOME/Library/Caches/smolvm" -name "*.log" -newer /tmp 2>/dev/null | head -5 || true
+          for f in $(find "$HOME/Library/Caches/smolvm" -name "agent-console.log" 2>/dev/null | head -3); do
+            echo "=== $f ==="; tail -40 "$f" || true
+          done
+          find "$HOME/Library/Caches/smolvm" -name "*.log" 2>/dev/null -exec sh -c 'echo "=== $1 ==="; tail -20 "$1"' _ {} \; | head -100 || true
