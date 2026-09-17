@@ -27,6 +27,7 @@ jobs:
           sysctl -n machdep.cpu.brand_string || true
           sysctl -n kern.hv_support || true
           sysctl -n kern.hv_vm_present || true
+          sysctl -n hw.ncpu hw.memsize || true
           uname -a
           df -h "$HOME" | tail -1
 
@@ -98,8 +99,101 @@ jobs:
       - name: Collect agent console logs
         if: always()
         run: |
-          find "$HOME/Library/Caches/smolvm" -name "*.log" -newer /tmp 2>/dev/null | head -5 || true
-          for f in $(find "$HOME/Library/Caches/smolvm" -name "agent-console.log" 2>/dev/null | head -3); do
-            echo "=== $f ==="; tail -40 "$f" || true
+          for f in $(find "$HOME/Library/Caches/smolvm" -name "*.log" 2>/dev/null | head -5); do
+            echo "=== $f ==="; tail -30 "$f" || true
           done
-          find "$HOME/Library/Caches/smolvm" -name "*.log" 2>/dev/null -exec sh -c 'echo "=== $1 ==="; tail -20 "$1"' _ {} \; | head -100 || true
+
+  # Mirror the exact shape preloop build-golden uses:
+  #   smolvm machine create --name X --image <img> --cpus 8 --mem 4096
+  #     --storage 200 --overlay 200 --net --net-backend tsi --dns 1.1.1.1
+  #     --mount-socket HOST:GUEST -- /bin/sh -c "sleep infinity"
+  preloop-shape:
+    name: "${{ matrix.os }} / preloop-shape / ${{ matrix.vary }}"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-latest]
+        vary: [full, cpus4, no-socket, small-disks]
+    env:
+      SMOLVM_VERSION: ${{ inputs.smolvm_version }}
+    steps:
+      - name: Environment probe
+        run: |
+          set -x
+          sw_vers
+          sysctl -n machdep.cpu.brand_string kern.hv_support kern.hv_vm_present hw.ncpu hw.memsize 2>/dev/null || true
+          df -h "$HOME" | tail -1
+
+      - name: Install smolvm ${{ env.SMOLVM_VERSION }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="smolvm-${SMOLVM_VERSION}-darwin-arm64.tar.gz"
+          BASE="https://github.com/smol-machines/smolvm/releases/download/v${SMOLVM_VERSION}"
+          curl -fsSL -o "$ARCHIVE" "$BASE/$ARCHIVE"
+          curl -fsSL -o checksums.sha256 "$BASE/checksums.sha256"
+          grep -F "$ARCHIVE" checksums.sha256 | shasum -a 256 -c -
+          tar -xzf "$ARCHIVE"
+          SRC="smolvm-${SMOLVM_VERSION}-darwin-arm64"
+          mkdir -p "$HOME/.smolvm"
+          rm -rf "$HOME/.smolvm/lib"
+          cp -R "$SRC/lib" "$HOME/.smolvm/lib"
+          for f in smolvm smolvm-bin storage-template.ext4 overlay-template.ext4 \
+              storage-template.ext4.zst overlay-template.ext4.zst; do
+            [ -f "$SRC/$f" ] && cp "$SRC/$f" "$HOME/.smolvm/"
+          done
+          mkdir -p "$HOME/Library/Application Support/smolvm"
+          rm -rf "$HOME/Library/Application Support/smolvm/agent-rootfs"
+          cp -R "$SRC/agent-rootfs" "$HOME/Library/Application Support/smolvm/agent-rootfs"
+          mkdir -p "$HOME/.local/bin"
+          ln -sf "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare 200G disk templates (as release-golden does)
+        run: |
+          set -euo pipefail
+          brew install e2fsprogs 2>/dev/null || true
+          export PATH="$(brew --prefix e2fsprogs)/sbin:$PATH"
+          rm -f "$HOME/.smolvm/storage-template.ext4" "$HOME/.smolvm/overlay-template.ext4"
+          truncate -s 200G "$HOME/.smolvm/storage-template.ext4"
+          mkfs.ext4 -F -q -O ^has_journal -b 4096 "$HOME/.smolvm/storage-template.ext4"
+          truncate -s 200G "$HOME/.smolvm/overlay-template.ext4"
+          mkfs.ext4 -F -q -O ^has_journal -b 4096 -L smolvm-overlay "$HOME/.smolvm/overlay-template.ext4"
+          ls -lh "$HOME/.smolvm/"*.ext4
+
+      - name: Create machine with preloop args
+        id: create
+        continue-on-error: true
+        env:
+          RUST_LOG: info
+          SMOLVM_KRUN_LOG_LEVEL: "4"
+        run: |
+          set -x
+          mkdir -p /tmp/sockdir
+          touch /tmp/sockdir/ctl.sock 2>/dev/null || true
+          # vary matrix: isolate which arg triggers EINVAL
+          CPUS=8; STORAGE=200; OVERLAY=200; SOCKET="--mount-socket /tmp/sockdir/ctl.sock:/run/preloop-ctl.sock"
+          case "${{ matrix.vary }}" in
+            full)         ;;
+            cpus4)        CPUS=4 ;;
+            no-socket)    SOCKET="" ;;
+            small-disks)  STORAGE=20; OVERLAY=10 ;;
+          esac
+          smolvm machine create --name repro \
+            --image alpine:latest \
+            --cpus $CPUS --mem 4096 \
+            --storage $STORAGE --overlay $OVERLAY \
+            --net --net-backend tsi --dns 1.1.1.1 \
+            $SOCKET \
+            -- /bin/sh -c "sleep infinity"
+          smolvm machine start --name repro
+          smolvm machine exec --name repro -- uname -a
+          smolvm machine stop --name repro
+          smolvm machine delete --name repro -f
+
+      - name: Collect agent console logs
+        if: always()
+        run: |
+          for f in $(find "$HOME/Library/Caches/smolvm" -name "*.log" 2>/dev/null | head -5); do
+            echo "=== $f ==="; tail -30 "$f" || true
+          done
