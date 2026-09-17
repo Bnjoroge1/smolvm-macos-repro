@@ -309,6 +309,9 @@ jobs:
           git clone --depth 1 --branch fix/pack-vm-storage-and-hv-probe \
             https://github.com/preloopdev/smolvm.git smolvm-src
           cd smolvm-src
+          # Link against the released libkrun from the install step — the
+          # submodule isn't fetched in a shallow clone.
+          export LIBKRUN_DIR="$HOME/.smolvm/lib"
           cargo build --release --bin smolvm
           codesign --force --sign - --entitlements smolvm.entitlements target/release/smolvm
           codesign -d --entitlements - target/release/smolvm 2>&1 | grep -A1 hypervisor || true
